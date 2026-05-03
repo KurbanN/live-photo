@@ -42,16 +42,84 @@ async function applyMaxVideoConstraints(track: MediaStreamTrack): Promise<void> 
     .catch(() => {});
 }
 
+type VideoTrackCaps = MediaTrackCapabilities & {
+  focusMode?: string[];
+};
+
+/** Непрерывный или одиночный автофокус, если драйвер камеры это отдаёт. */
+function tryEnableContinuousFocus(track: MediaStreamTrack): void {
+  const caps = track.getCapabilities?.() as VideoTrackCaps | undefined;
+  const modes = caps?.focusMode;
+  if (!Array.isArray(modes)) return;
+  const prefer: Array<'continuous' | 'single-shot'> = ['continuous', 'single-shot'];
+  for (const m of prefer) {
+    if (modes.includes(m)) {
+      track
+        .applyConstraints({ advanced: [{ focusMode: m }] } as unknown as MediaTrackConstraints)
+        .catch(() => {});
+      return;
+    }
+  }
+}
+
+/** Точка фокуса (0…1) в координатах кадра; на части Android срабатывает `pointsOfInterest`. */
+async function tryFocusAtNormalizedPoint(track: MediaStreamTrack, nx: number, ny: number): Promise<void> {
+  const x = Math.max(0, Math.min(1, nx));
+  const y = Math.max(0, Math.min(1, ny));
+  try {
+    await track.applyConstraints({
+      advanced: [{ pointsOfInterest: [{ x, y }] }],
+    } as unknown as MediaTrackConstraints);
+  } catch {
+    /* не поддерживается */
+  }
+  const caps = track.getCapabilities?.() as VideoTrackCaps | undefined;
+  const modes = caps?.focusMode;
+  if (Array.isArray(modes) && modes.includes('single-shot')) {
+    await track
+      .applyConstraints({ advanced: [{ focusMode: 'single-shot' }] } as unknown as MediaTrackConstraints)
+      .catch(() => {});
+  }
+}
+
+/** Селфи с фронтальной камеры часто отдаются «как в зеркале» — переворачиваем файл, чтобы в ленте было без зеркала. */
+async function flipBlobHorizontally(blob: Blob): Promise<Blob> {
+  try {
+    const bmp = await createImageBitmap(blob);
+    const canvas = document.createElement('canvas');
+    canvas.width = bmp.width;
+    canvas.height = bmp.height;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) {
+      bmp.close();
+      return blob;
+    }
+    ctx.translate(canvas.width, 0);
+    ctx.scale(-1, 1);
+    ctx.drawImage(bmp, 0, 0);
+    bmp.close();
+    const mime = blob.type === 'image/png' ? 'image/png' : 'image/jpeg';
+    const quality = mime === 'image/jpeg' ? 0.95 : undefined;
+    return await new Promise((resolve, reject) => {
+      canvas.toBlob((b) => (b ? resolve(b) : reject(new Error('Не удалось сохранить снимок'))), mime, quality);
+    });
+  } catch {
+    return blob;
+  }
+}
+
 /**
  * Полноразмерный кадр с камеры, если браузер умеет `ImageCapture.takePhoto()`;
  * иначе — JPEG с текущего превью (размер = размеру потока после constraints).
  */
-async function captureStillFromVideo(video: HTMLVideoElement): Promise<Blob> {
+async function captureStillFromVideo(video: HTMLVideoElement, isSelfie: boolean): Promise<Blob> {
   const src = video.srcObject;
   if (!(src instanceof MediaStream)) throw new Error('Нет камеры');
 
   const track = src.getVideoTracks()[0];
   if (!track) throw new Error('Нет видеодорожки');
+
+  let blob: Blob | null = null;
 
   const ImageCaptureCtor = (
     globalThis as typeof globalThis & {
@@ -61,33 +129,38 @@ async function captureStillFromVideo(video: HTMLVideoElement): Promise<Blob> {
   if (ImageCaptureCtor) {
     try {
       const ic = new ImageCaptureCtor(track);
-      const blob = await ic.takePhoto();
-      if (blob.size > 0) return blob;
+      const b = await ic.takePhoto();
+      if (b.size > 0) blob = b;
     } catch {
       /* ниже — кадр с video */
     }
   }
 
-  const w = video.videoWidth;
-  const h = video.videoHeight;
-  if (!w || !h) throw new Error('Камера ещё не готова');
+  if (!blob) {
+    const w = video.videoWidth;
+    const h = video.videoHeight;
+    if (!w || !h) throw new Error('Камера ещё не готова');
 
-  const canvas = document.createElement('canvas');
-  canvas.width = w;
-  canvas.height = h;
-  const ctx = canvas.getContext('2d');
-  if (!ctx) throw new Error('Нет canvas');
-  ctx.imageSmoothingEnabled = true;
-  ctx.imageSmoothingQuality = 'high';
-  ctx.drawImage(video, 0, 0);
+    const canvas = document.createElement('canvas');
+    canvas.width = w;
+    canvas.height = h;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) throw new Error('Нет canvas');
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'high';
+    ctx.drawImage(video, 0, 0);
 
-  return await new Promise<Blob>((resolve, reject) => {
-    canvas.toBlob(
-      (b) => (b ? resolve(b) : reject(new Error('Снимок не создан'))),
-      'image/jpeg',
-      1,
-    );
-  });
+    blob = await new Promise<Blob>((resolve, reject) => {
+      canvas.toBlob(
+        (b) => (b ? resolve(b) : reject(new Error('Снимок не создан'))),
+        'image/jpeg',
+        1,
+      );
+    });
+  }
+
+  if (isSelfie) return flipBlobHorizontally(blob);
+  return blob;
 }
 
 type Tab = 'shoot' | 'feed';
@@ -191,6 +264,7 @@ export default function App() {
       }
       const vtrack = stream.getVideoTracks()[0];
       if (vtrack) await applyMaxVideoConstraints(vtrack);
+      if (vtrack) tryEnableContinuousFocus(vtrack);
       if (gen !== cameraGeneration.current) {
         stream.getTracks().forEach((tr) => tr.stop());
         return;
@@ -221,6 +295,23 @@ export default function App() {
       void openCamera();
     });
   }, [pendingPreviewUrl, stopCamera, openCamera]);
+
+  const handleVideoTapFocus = useCallback(
+    (e: React.PointerEvent<HTMLVideoElement>) => {
+      if (pendingPreviewUrl || !streamRef.current) return;
+      const track = streamRef.current.getVideoTracks()[0];
+      if (!track?.readyState || track.readyState !== 'live') return;
+      const el = videoRef.current;
+      if (!el) return;
+      const rect = el.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0) return;
+      let nx = (e.clientX - rect.left) / rect.width;
+      const ny = (e.clientY - rect.top) / rect.height;
+      if (cameraFacing === 'user') nx = 1 - nx;
+      void tryFocusAtNormalizedPoint(track, nx, ny);
+    },
+    [pendingPreviewUrl, cameraFacing],
+  );
 
   useEffect(() => {
     if (tab !== 'shoot' || !pin) stopCamera();
@@ -265,7 +356,7 @@ export default function App() {
     if (!videoRef.current || pendingPreviewUrl) return;
     setShootError('');
     try {
-      const blob = await captureStillFromVideo(videoRef.current);
+      const blob = await captureStillFromVideo(videoRef.current, cameraFacing === 'user');
       pendingBlobRef.current = blob;
       setPendingPreviewUrl((prev) => {
         if (prev) URL.revokeObjectURL(prev);
@@ -449,11 +540,12 @@ export default function App() {
             <div className="relative aspect-[3/4] bg-black overflow-hidden border border-line">
               <video
                 ref={videoRef}
-                className={`absolute inset-0 h-full w-full object-cover transition-opacity duration-200 ${
-                  cameraReady && !pendingPreviewUrl ? 'opacity-100' : 'opacity-0'
+                className={`absolute inset-0 z-[1] h-full w-full object-cover transition-opacity duration-200 ${
+                  cameraReady && !pendingPreviewUrl ? 'cursor-pointer opacity-100 touch-manipulation' : 'opacity-0'
                 } ${cameraFacing === 'user' ? '[transform:scaleX(-1)]' : ''}`}
                 playsInline
                 muted
+                onPointerDown={cameraReady && !pendingPreviewUrl ? handleVideoTapFocus : undefined}
               />
               {!cameraReady && !pendingPreviewUrl && (
                 <div className="absolute inset-0 flex flex-col">
