@@ -26,6 +26,69 @@ import {
 /** Фон экрана входа: `public/login-bg.jpg` (копия пригласительного кадра). Учитывает `base` Vite (GitHub Pages: `/repo/`). */
 const LOGIN_BG_URL = `${import.meta.env.BASE_URL}login-bg.jpg`;
 
+/** Поднять разрешение видеопотока до максимума, который отдаёт камера (до кадра с canvas). */
+async function applyMaxVideoConstraints(track: MediaStreamTrack): Promise<void> {
+  const caps = track.getCapabilities?.();
+  if (!caps?.width || !caps.height) return;
+  const wMax = typeof caps.width.max === 'number' ? caps.width.max : undefined;
+  const hMax = typeof caps.height.max === 'number' ? caps.height.max : undefined;
+  if (!wMax || !hMax) return;
+  await track
+    .applyConstraints({
+      width: { ideal: Math.min(wMax, 8192) },
+      height: { ideal: Math.min(hMax, 8192) },
+    })
+    .catch(() => {});
+}
+
+/**
+ * Полноразмерный кадр с камеры, если браузер умеет `ImageCapture.takePhoto()`;
+ * иначе — JPEG с текущего превью (размер = размеру потока после constraints).
+ */
+async function captureStillFromVideo(video: HTMLVideoElement): Promise<Blob> {
+  const src = video.srcObject;
+  if (!(src instanceof MediaStream)) throw new Error('Нет камеры');
+
+  const track = src.getVideoTracks()[0];
+  if (!track) throw new Error('Нет видеодорожки');
+
+  const ImageCaptureCtor = (
+    globalThis as typeof globalThis & {
+      ImageCapture?: new (t: MediaStreamTrack) => { takePhoto: () => Promise<Blob> };
+    }
+  ).ImageCapture;
+  if (ImageCaptureCtor) {
+    try {
+      const ic = new ImageCaptureCtor(track);
+      const blob = await ic.takePhoto();
+      if (blob.size > 0) return blob;
+    } catch {
+      /* ниже — кадр с video */
+    }
+  }
+
+  const w = video.videoWidth;
+  const h = video.videoHeight;
+  if (!w || !h) throw new Error('Камера ещё не готова');
+
+  const canvas = document.createElement('canvas');
+  canvas.width = w;
+  canvas.height = h;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) throw new Error('Нет canvas');
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = 'high';
+  ctx.drawImage(video, 0, 0);
+
+  return await new Promise<Blob>((resolve, reject) => {
+    canvas.toBlob(
+      (b) => (b ? resolve(b) : reject(new Error('Снимок не создан'))),
+      'image/jpeg',
+      1,
+    );
+  });
+}
+
 type Tab = 'shoot' | 'feed';
 
 export default function App() {
@@ -45,8 +108,11 @@ export default function App() {
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
+  const cameraGeneration = useRef(0);
+  const cameraOpeningRef = useRef(false);
   const [cameraReady, setCameraReady] = useState(false);
   const [cameraBlocked, setCameraBlocked] = useState(false);
+  const [cameraOpening, setCameraOpening] = useState(false);
 
   const loadFeed = useCallback(async () => {
     if (!pin) return;
@@ -66,43 +132,72 @@ export default function App() {
     return () => window.clearInterval(t);
   }, [pin, loadFeed]);
 
-  useEffect(() => {
-    if (tab !== 'shoot' || !pin) return;
+  const stopCamera = useCallback(() => {
+    cameraGeneration.current += 1;
+    cameraOpeningRef.current = false;
+    streamRef.current?.getTracks().forEach((tr) => tr.stop());
+    streamRef.current = null;
+    const el = videoRef.current;
+    if (el) el.srcObject = null;
+    setCameraReady(false);
+    setCameraBlocked(false);
+    setCameraOpening(false);
+  }, []);
 
-    let cancelled = false;
-    (async () => {
-      setCameraBlocked(false);
-      setCameraReady(false);
+  /** Камера только по явному нажатию (удобнее разрешения на телефоне). */
+  const openCamera = useCallback(async () => {
+    if (!pin || streamRef.current || cameraOpeningRef.current) return;
+    const gen = cameraGeneration.current;
+    cameraOpeningRef.current = true;
+    setShootError('');
+    setCameraBlocked(false);
+    setCameraReady(false);
+    setCameraOpening(true);
+    try {
+      let stream: MediaStream;
       try {
-        const stream = await navigator.mediaDevices.getUserMedia({
-          video: { facingMode: { ideal: 'environment' } },
+        stream = await navigator.mediaDevices.getUserMedia({
           audio: false,
+          video: {
+            facingMode: { ideal: 'environment' },
+            width: { ideal: 3840 },
+            height: { ideal: 2160 },
+          },
         });
-        if (cancelled) {
-          stream.getTracks().forEach((tr) => tr.stop());
-          return;
-        }
-        streamRef.current = stream;
-        const el = videoRef.current;
-        if (el) {
-          el.srcObject = stream;
-          await el.play().catch(() => {});
-          setCameraReady(true);
-        }
       } catch {
-        setCameraBlocked(true);
+        stream = await navigator.mediaDevices.getUserMedia({
+          audio: false,
+          video: { facingMode: { ideal: 'environment' } },
+        });
       }
-    })();
-
-    return () => {
-      cancelled = true;
-      streamRef.current?.getTracks().forEach((tr) => tr.stop());
-      streamRef.current = null;
+      if (gen !== cameraGeneration.current) {
+        stream.getTracks().forEach((tr) => tr.stop());
+        return;
+      }
+      const vtrack = stream.getVideoTracks()[0];
+      if (vtrack) await applyMaxVideoConstraints(vtrack);
+      if (gen !== cameraGeneration.current) {
+        stream.getTracks().forEach((tr) => tr.stop());
+        return;
+      }
+      streamRef.current = stream;
       const el = videoRef.current;
-      if (el) el.srcObject = null;
-      setCameraReady(false);
-    };
-  }, [tab, pin]);
+      if (el) {
+        el.srcObject = stream;
+        await el.play().catch(() => {});
+        setCameraReady(true);
+      }
+    } catch {
+      setCameraBlocked(true);
+    } finally {
+      cameraOpeningRef.current = false;
+      if (gen === cameraGeneration.current) setCameraOpening(false);
+    }
+  }, [pin]);
+
+  useEffect(() => {
+    if (tab !== 'shoot' || !pin) stopCamera();
+  }, [tab, pin, stopCamera]);
 
   const handlePinSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -141,28 +236,10 @@ export default function App() {
   const captureAndUpload = async () => {
     if (!pin || !videoRef.current) return;
     const video = videoRef.current;
-    const w = video.videoWidth;
-    const h = video.videoHeight;
-    if (!w || !h) {
-      setShootError('Камера ещё не готова');
-      return;
-    }
     setShootError('');
     setUploading(true);
     try {
-      const canvas = document.createElement('canvas');
-      canvas.width = w;
-      canvas.height = h;
-      const ctx = canvas.getContext('2d');
-      if (!ctx) throw new Error('Нет canvas');
-      ctx.drawImage(video, 0, 0);
-      const blob = await new Promise<Blob>((resolve, reject) => {
-        canvas.toBlob(
-          (b) => (b ? resolve(b) : reject(new Error('Снимок не создан'))),
-          'image/jpeg',
-          1,
-        );
-      });
+      const blob = await captureStillFromVideo(video);
       await uploadPhoto(pin, blob, author || undefined);
       setAuthor('');
       await loadFeed();
@@ -179,7 +256,7 @@ export default function App() {
     const input = document.createElement('input');
     input.type = 'file';
     input.accept = 'image/*';
-    input.capture = 'environment';
+    // Без `capture`: иначе часть браузеров даёт урезанный снимок вместо файла из галереи в полном размере.
     input.onchange = async () => {
       const file = input.files?.[0];
       if (!file) return;
@@ -325,21 +402,63 @@ export default function App() {
             <div className="relative aspect-[3/4] bg-black overflow-hidden border border-line">
               <video
                 ref={videoRef}
-                className="absolute inset-0 w-full h-full object-cover"
+                className={`absolute inset-0 w-full h-full object-cover transition-opacity duration-200 ${
+                  cameraReady ? 'opacity-100' : 'opacity-0'
+                }`}
                 playsInline
                 muted
-                autoPlay
               />
-              {!cameraReady && !cameraBlocked && (
-                <div className="absolute inset-0 flex items-center justify-center bg-black/50 text-paper text-sm">
-                  <Loader2 className="w-8 h-8 animate-spin" />
+              {!cameraReady && (
+                <div className="absolute inset-0 flex flex-col">
+                  <div
+                    className="absolute inset-0 bg-cover bg-center"
+                    style={{ backgroundImage: `url(${LOGIN_BG_URL})` }}
+                    aria-hidden
+                  />
+                  <div
+                    className="absolute inset-0 bg-gradient-to-b from-black/55 via-black/45 to-black/65"
+                    aria-hidden
+                  />
+                  <div className="relative z-10 flex flex-1 flex-col items-center justify-center gap-5 p-6 text-center">
+                    {cameraOpening ? (
+                      <Loader2 className="h-10 w-10 animate-spin text-paper" aria-label="Открываем камеру" />
+                    ) : cameraBlocked ? (
+                      <>
+                        <p className="max-w-xs text-sm leading-relaxed text-paper">
+                          Не удалось открыть камеру. Разрешите доступ в настройках браузера или загрузите фото из
+                          галереи.
+                        </p>
+                        <button
+                          type="button"
+                          onClick={openCamera}
+                          className="bg-ink px-6 py-3 text-xs font-semibold uppercase tracking-[0.2em] text-paper"
+                        >
+                          Попробовать снова
+                        </button>
+                      </>
+                    ) : (
+                      <>
+                        <Camera className="h-12 w-12 text-paper/90" aria-hidden />
+                        <button
+                          type="button"
+                          onClick={openCamera}
+                          className="bg-ink px-8 py-4 text-xs font-semibold uppercase tracking-[0.25em] text-paper shadow-lg"
+                        >
+                          Открыть камеру
+                        </button>
+                      </>
+                    )}
+                  </div>
                 </div>
               )}
-              {cameraBlocked && (
-                <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/80 text-paper p-6 text-center text-sm leading-relaxed">
-                  Не удалось открыть камеру. Разрешите доступ в настройках браузера или загрузите фото из
-                  галереи.
-                </div>
+              {cameraReady && (
+                <button
+                  type="button"
+                  onClick={stopCamera}
+                  className="absolute bottom-3 right-3 z-10 border border-paper/40 bg-black/50 px-3 py-2 text-[10px] font-semibold uppercase tracking-[0.15em] text-paper backdrop-blur-sm"
+                >
+                  Выключить
+                </button>
               )}
             </div>
 
@@ -359,7 +478,7 @@ export default function App() {
             <div className="flex flex-col sm:flex-row gap-3">
               <button
                 type="button"
-                disabled={uploading || cameraBlocked || !cameraReady}
+                disabled={uploading || !cameraReady}
                 onClick={captureAndUpload}
                 className="flex-1 bg-ink text-paper py-4 flex items-center justify-center gap-2 text-xs uppercase tracking-[0.2em] font-semibold disabled:opacity-50"
               >

@@ -66,9 +66,20 @@ export async function fetchPhotos(pin: string): Promise<PhotoEntry[]> {
   return body.photos;
 }
 
+function uploadFilename(blob: Blob): string {
+  if (blob instanceof File && blob.name?.trim()) {
+    const n = blob.name.trim();
+    if (/\.(jpe?g|png|webp|heic|heif|gif)$/i.test(n)) return n;
+  }
+  if (blob.type === 'image/png') return 'photo.png';
+  if (blob.type === 'image/webp') return 'photo.webp';
+  if (blob.type === 'image/heic' || blob.type === 'image/heif') return 'photo.heic';
+  return 'photo.jpg';
+}
+
 export async function uploadPhoto(pin: string, blob: Blob, author?: string): Promise<PhotoEntry> {
   const form = new FormData();
-  form.append('photo', blob, 'photo.jpg');
+  form.append('photo', blob, uploadFilename(blob));
   if (author?.trim()) form.append('author', author.trim());
   const res = await fetch(apiUrl('/api/upload'), {
     method: 'POST',
