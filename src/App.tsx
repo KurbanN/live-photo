@@ -23,8 +23,8 @@ import {
   type PhotoEntry,
 } from '@/lib/api';
 
-/** Фон экрана входа: `public/login-bg.jpg` (копия пригласительного кадра). */
-const LOGIN_BG_URL = '/login-bg.jpg';
+/** Фон экрана входа: `public/login-bg.jpg` (копия пригласительного кадра). Учитывает `base` Vite (GitHub Pages: `/repo/`). */
+const LOGIN_BG_URL = new URL('login-bg.jpg', import.meta.env.BASE_URL).href;
 
 type Tab = 'shoot' | 'feed';
 

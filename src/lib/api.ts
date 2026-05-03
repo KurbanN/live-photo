@@ -20,10 +20,15 @@ export function apiHeaders(pin: string): HeadersInit {
   return { 'X-Event-Pin': pin };
 }
 
-/** Для статики на GitHub Pages укажите URL бэкенда в `VITE_API_BASE_URL` при сборке. */
+/**
+ * Для статики на GitHub Pages укажите полный URL API при сборке (`VITE_API_BASE_URL`),
+ * иначе запросы пойдут на тот же хостинг и `/api/*` вернёт 404.
+ */
 function apiUrl(path: string): string {
-  const prefix = import.meta.env.VITE_API_BASE_URL ?? '';
-  return `${prefix}${path}`;
+  const raw = import.meta.env.VITE_API_BASE_URL?.trim() ?? '';
+  const prefix = raw.replace(/\/+$/, '');
+  const p = path.startsWith('/') ? path : `/${path}`;
+  return `${prefix}${p}`;
 }
 
 export type PhotoEntry = {
