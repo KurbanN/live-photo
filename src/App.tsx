@@ -449,9 +449,9 @@ export default function App() {
             <div className="relative aspect-[3/4] bg-black overflow-hidden border border-line">
               <video
                 ref={videoRef}
-                className={`absolute inset-0 w-full h-full object-cover transition-opacity duration-200 ${
+                className={`absolute inset-0 h-full w-full object-cover transition-opacity duration-200 ${
                   cameraReady && !pendingPreviewUrl ? 'opacity-100' : 'opacity-0'
-                }`}
+                } ${cameraFacing === 'user' ? '[transform:scaleX(-1)]' : ''}`}
                 playsInline
                 muted
               />
