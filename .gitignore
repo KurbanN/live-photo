@@ -1,0 +1,13 @@
+node_modules/
+# Отдельный репозиторий приглашения (git clone в эту папку); не смешивать с историей этого проекта
+live-photo/
+dist/
+dist-server/
+data/
+.env
+*.log
+.DS_Store
+
+# Локальные agent skills (не коммитить)
+.agents/
+skills-lock.json
