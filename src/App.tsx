@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   Camera,
+  FileImage,
   Grid3x3,
   ImagePlus,
   Download,
@@ -98,8 +99,10 @@ async function flipBlobHorizontally(blob: Blob): Promise<Blob> {
     ctx.scale(-1, 1);
     ctx.drawImage(bmp, 0, 0);
     bmp.close();
-    const mime = blob.type === 'image/png' ? 'image/png' : 'image/jpeg';
-    const quality = mime === 'image/jpeg' ? 0.95 : undefined;
+    const mime =
+      blob.type === 'image/png' ? 'image/png' : blob.type === 'image/webp' ? 'image/webp' : 'image/jpeg';
+    /** Максимальное качество при повторном кодировании (селфи после отражения). */
+    const quality = mime === 'image/jpeg' || mime === 'image/webp' ? 1 : undefined;
     return await new Promise((resolve, reject) => {
       canvas.toBlob((b) => (b ? resolve(b) : reject(new Error('Не удалось сохранить снимок'))), mime, quality);
     });
@@ -164,6 +167,13 @@ async function captureStillFromVideo(video: HTMLVideoElement, isSelfie: boolean)
 }
 
 type Tab = 'shoot' | 'feed';
+
+/** Для режима «как документ»: тип иногда пустой (iOS), тогда смотрим расширение. */
+function isProbablyImageFile(file: File): boolean {
+  if (file.type.startsWith('image/')) return true;
+  const name = file.name?.trim() ?? '';
+  return /\.(jpe?g|png|gif|webp|heic|heif|bmp|tiff?)$/i.test(name);
+}
 
 export default function App() {
   const [pin, setPin] = useState<string | null>(() => getStoredPin());
@@ -389,15 +399,19 @@ export default function App() {
     }
   };
 
-  const pickFromGallery = async () => {
+  const triggerImageUpload = (opts: { accept: string; validateAsImage: boolean }) => {
     if (!pin) return;
     const input = document.createElement('input');
     input.type = 'file';
-    input.accept = 'image/*';
+    input.accept = opts.accept;
     // Без `capture`: иначе часть браузеров даёт урезанный снимок вместо файла из галереи в полном размере.
     input.onchange = async () => {
       const file = input.files?.[0];
       if (!file) return;
+      if (opts.validateAsImage && !isProbablyImageFile(file)) {
+        setShootError('Нужен файл изображения (например .jpg, .png, .heic).');
+        return;
+      }
       setShootError('');
       setUploading(true);
       try {
@@ -413,6 +427,11 @@ export default function App() {
     };
     input.click();
   };
+
+  const pickFromGallery = () => triggerImageUpload({ accept: 'image/*', validateAsImage: false });
+
+  /** Как «документ» в мессенджере: любой файл из проводника — оригинальные байты без съёмки через камеру в браузере. */
+  const pickImageAsDocument = () => triggerImageUpload({ accept: '*/*', validateAsImage: true });
 
   const handleDelete = async (id: string) => {
     if (!pin || !confirm('Удалить это фото из общей ленты?')) return;
@@ -668,18 +687,34 @@ export default function App() {
 
             {shootError && <p className="text-sm text-red-700">{shootError}</p>}
 
-            <button
-              type="button"
-              disabled={uploading || pendingPreviewUrl !== null}
-              onClick={pickFromGallery}
-              className="flex w-full items-center justify-center gap-2 border border-ink py-4 text-xs font-semibold uppercase tracking-[0.2em] text-ink disabled:opacity-50"
-            >
-              <ImagePlus className="h-5 w-5" />
-              Из галереи
-            </button>
+            <div className="flex flex-col gap-3">
+              <button
+                type="button"
+                disabled={uploading || pendingPreviewUrl !== null}
+                onClick={pickFromGallery}
+                className="flex w-full items-center justify-center gap-2 border border-ink py-4 text-xs font-semibold uppercase tracking-[0.2em] text-ink disabled:opacity-50"
+              >
+                <ImagePlus className="h-5 w-5" />
+                Из галереи
+              </button>
+              <button
+                type="button"
+                disabled={uploading || pendingPreviewUrl !== null}
+                onClick={pickImageAsDocument}
+                className="flex w-full flex-col items-center justify-center gap-1 border border-ink bg-white/80 py-4 text-ink disabled:opacity-50"
+              >
+                <span className="flex items-center gap-2 text-xs font-semibold uppercase tracking-[0.2em]">
+                  <FileImage className="h-5 w-5 shrink-0" />
+                  Как файл (лучшее качество)
+                </span>
+                <span className="max-w-[280px] px-2 text-center text-[10px] font-normal normal-case leading-snug tracking-normal text-muted">
+                  Оригинал с телефона или из «Файлов», без пересжатия в браузере — как «отправить документом».
+                </span>
+              </button>
+            </div>
             <p className="text-[11px] text-muted leading-relaxed text-center">
-              Снимок с камеры: круглая кнопка, затем «В ленту» или «Переснять». Из галереи — сразу в ленту. Удалить
-              снимок может любой с кодом.
+              С камеры: круглая кнопка, затем «В ленту» или «Переснять». Для максимального качества — «Как файл».
+              Удалить снимок может любой с кодом.
             </p>
           </div>
         )}

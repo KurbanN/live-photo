@@ -49,11 +49,17 @@ function publicUrlForPath(storagePath: string): string {
   return data.publicUrl;
 }
 
+function looksLikeImageUpload(file: Express.Multer.File): boolean {
+  if (file.mimetype.startsWith('image/')) return true;
+  const name = (file.originalname || '').toLowerCase();
+  return /\.(jpe?g|png|gif|webp|heic|heif|bmp|tiff?)$/.test(name);
+}
+
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: MAX_FILE_MB * 1024 * 1024 },
   fileFilter: (_req, file, cb) => {
-    if (file.mimetype.startsWith('image/')) cb(null, true);
+    if (looksLikeImageUpload(file)) cb(null, true);
     else cb(new Error('Только изображения'));
   },
 });
@@ -181,8 +187,10 @@ export function createApp() {
       try {
         const supabase = getSupabase();
         const bucket = getBucket();
+        const contentType =
+          req.file.mimetype.startsWith('image/') ? req.file.mimetype : mimeFromFilename(ext);
         const { error: upErr } = await supabase.storage.from(bucket).upload(storagePath, req.file.buffer, {
-          contentType: req.file.mimetype || mimeFromFilename(ext),
+          contentType,
           upsert: false,
         });
         if (upErr) throw upErr;
