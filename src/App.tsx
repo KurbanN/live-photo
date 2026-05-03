@@ -8,6 +8,7 @@ import {
   LogOut,
   RefreshCw,
   Send,
+  SwitchCamera,
   Trash2,
   X,
 } from 'lucide-react';
@@ -110,9 +111,21 @@ export default function App() {
   const streamRef = useRef<MediaStream | null>(null);
   const cameraGeneration = useRef(0);
   const cameraOpeningRef = useRef(false);
+  const facingRef = useRef<'environment' | 'user'>('environment');
+  const pendingBlobRef = useRef<Blob | null>(null);
+  const [cameraFacing, setCameraFacing] = useState<'environment' | 'user'>('environment');
+  const [pendingPreviewUrl, setPendingPreviewUrl] = useState<string | null>(null);
   const [cameraReady, setCameraReady] = useState(false);
   const [cameraBlocked, setCameraBlocked] = useState(false);
   const [cameraOpening, setCameraOpening] = useState(false);
+
+  const discardPending = useCallback(() => {
+    pendingBlobRef.current = null;
+    setPendingPreviewUrl((prev) => {
+      if (prev) URL.revokeObjectURL(prev);
+      return null;
+    });
+  }, []);
 
   const loadFeed = useCallback(async () => {
     if (!pin) return;
@@ -142,7 +155,8 @@ export default function App() {
     setCameraReady(false);
     setCameraBlocked(false);
     setCameraOpening(false);
-  }, []);
+    discardPending();
+  }, [discardPending]);
 
   /** Камера только по явному нажатию (удобнее разрешения на телефоне). */
   const openCamera = useCallback(async () => {
@@ -154,12 +168,13 @@ export default function App() {
     setCameraReady(false);
     setCameraOpening(true);
     try {
+      const facing = facingRef.current;
       let stream: MediaStream;
       try {
         stream = await navigator.mediaDevices.getUserMedia({
           audio: false,
           video: {
-            facingMode: { ideal: 'environment' },
+            facingMode: { ideal: facing },
             width: { ideal: 3840 },
             height: { ideal: 2160 },
           },
@@ -167,7 +182,7 @@ export default function App() {
       } catch {
         stream = await navigator.mediaDevices.getUserMedia({
           audio: false,
-          video: { facingMode: { ideal: 'environment' } },
+          video: { facingMode: { ideal: facing } },
         });
       }
       if (gen !== cameraGeneration.current) {
@@ -194,6 +209,18 @@ export default function App() {
       if (gen === cameraGeneration.current) setCameraOpening(false);
     }
   }, [pin]);
+
+  const flipCamera = useCallback(() => {
+    if (pendingPreviewUrl) return;
+    const next = facingRef.current === 'environment' ? 'user' : 'environment';
+    facingRef.current = next;
+    setCameraFacing(next);
+    if (!streamRef.current && !cameraOpeningRef.current) return;
+    stopCamera();
+    queueMicrotask(() => {
+      void openCamera();
+    });
+  }, [pendingPreviewUrl, stopCamera, openCamera]);
 
   useEffect(() => {
     if (tab !== 'shoot' || !pin) stopCamera();
@@ -227,20 +254,40 @@ export default function App() {
   };
 
   const logout = () => {
+    discardPending();
     clearStoredPin();
     setPin(null);
     setPhotos([]);
     setLightbox(null);
   };
 
-  const captureAndUpload = async () => {
-    if (!pin || !videoRef.current) return;
-    const video = videoRef.current;
+  const takePhoto = async () => {
+    if (!videoRef.current || pendingPreviewUrl) return;
+    setShootError('');
+    try {
+      const blob = await captureStillFromVideo(videoRef.current);
+      pendingBlobRef.current = blob;
+      setPendingPreviewUrl((prev) => {
+        if (prev) URL.revokeObjectURL(prev);
+        return URL.createObjectURL(blob);
+      });
+    } catch (e) {
+      setShootError(e instanceof Error ? e.message : 'Не удалось снять');
+    }
+  };
+
+  const retakePhoto = () => {
+    discardPending();
+  };
+
+  const confirmPendingUpload = async () => {
+    const blob = pendingBlobRef.current;
+    if (!pin || !blob) return;
     setShootError('');
     setUploading(true);
     try {
-      const blob = await captureStillFromVideo(video);
-      await uploadPhoto(pin, blob, author || undefined);
+      await uploadPhoto(pin, blob, author.trim() || undefined);
+      discardPending();
       setAuthor('');
       await loadFeed();
       setTab('feed');
@@ -403,12 +450,12 @@ export default function App() {
               <video
                 ref={videoRef}
                 className={`absolute inset-0 w-full h-full object-cover transition-opacity duration-200 ${
-                  cameraReady ? 'opacity-100' : 'opacity-0'
+                  cameraReady && !pendingPreviewUrl ? 'opacity-100' : 'opacity-0'
                 }`}
                 playsInline
                 muted
               />
-              {!cameraReady && (
+              {!cameraReady && !pendingPreviewUrl && (
                 <div className="absolute inset-0 flex flex-col">
                   <div
                     className="absolute inset-0 bg-cover bg-center"
@@ -451,14 +498,68 @@ export default function App() {
                   </div>
                 </div>
               )}
-              {cameraReady && (
-                <button
-                  type="button"
-                  onClick={stopCamera}
-                  className="absolute bottom-3 right-3 z-10 border border-paper/40 bg-black/50 px-3 py-2 text-[10px] font-semibold uppercase tracking-[0.15em] text-paper backdrop-blur-sm"
-                >
-                  Выключить
-                </button>
+              {pendingPreviewUrl && (
+                <div className="absolute inset-0 z-30 flex flex-col bg-black">
+                  <img
+                    src={pendingPreviewUrl}
+                    alt="Предпросмотр снимка"
+                    className="min-h-0 w-full flex-1 object-contain"
+                  />
+                  <div className="flex shrink-0 gap-3 border-t border-white/10 bg-black/90 p-4">
+                    <button
+                      type="button"
+                      onClick={retakePhoto}
+                      disabled={uploading}
+                      className="flex-1 border border-paper/50 py-3 text-xs font-semibold uppercase tracking-[0.18em] text-paper disabled:opacity-50"
+                    >
+                      Переснять
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => void confirmPendingUpload()}
+                      disabled={uploading}
+                      className="flex flex-1 items-center justify-center gap-2 bg-paper py-3 text-xs font-semibold uppercase tracking-[0.18em] text-ink disabled:opacity-50"
+                    >
+                      {uploading ? <Loader2 className="h-5 w-5 animate-spin" /> : <Send className="h-5 w-5" />}
+                      В ленту
+                    </button>
+                  </div>
+                </div>
+              )}
+              {cameraReady && !pendingPreviewUrl && (
+                <>
+                  <div
+                    className="pointer-events-none absolute inset-x-0 bottom-0 z-10 h-36 bg-gradient-to-t from-black/80 to-transparent"
+                    aria-hidden
+                  />
+                  <button
+                    type="button"
+                    onClick={flipCamera}
+                    disabled={cameraOpening}
+                    className="absolute bottom-5 left-4 z-20 flex h-12 w-12 items-center justify-center rounded-full border border-paper/50 bg-black/45 text-paper backdrop-blur-sm disabled:opacity-40"
+                    aria-label={
+                      cameraFacing === 'environment' ? 'Переключить на фронтальную камеру' : 'Переключить на основную камеру'
+                    }
+                  >
+                    <SwitchCamera className="h-5 w-5" />
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void takePhoto()}
+                    disabled={cameraOpening}
+                    className="absolute bottom-5 left-1/2 z-20 flex h-[4.5rem] w-[4.5rem] -translate-x-1/2 items-center justify-center rounded-full border-[4px] border-paper bg-transparent shadow-lg disabled:opacity-40"
+                    aria-label="Сфотографировать"
+                  >
+                    <span className="block h-[3.25rem] w-[3.25rem] rounded-full bg-paper" />
+                  </button>
+                  <button
+                    type="button"
+                    onClick={stopCamera}
+                    className="absolute bottom-5 right-4 z-20 border border-paper/40 bg-black/50 px-3 py-2 text-[10px] font-semibold uppercase tracking-[0.15em] text-paper backdrop-blur-sm"
+                  >
+                    Выключить
+                  </button>
+                </>
               )}
             </div>
 
@@ -475,29 +576,18 @@ export default function App() {
 
             {shootError && <p className="text-sm text-red-700">{shootError}</p>}
 
-            <div className="flex flex-col sm:flex-row gap-3">
-              <button
-                type="button"
-                disabled={uploading || !cameraReady}
-                onClick={captureAndUpload}
-                className="flex-1 bg-ink text-paper py-4 flex items-center justify-center gap-2 text-xs uppercase tracking-[0.2em] font-semibold disabled:opacity-50"
-              >
-                {uploading ? <Loader2 className="w-5 h-5 animate-spin" /> : <Send className="w-5 h-5" />}
-                Отправить в ленту
-              </button>
-              <button
-                type="button"
-                disabled={uploading}
-                onClick={pickFromGallery}
-                className="flex-1 border border-ink py-4 flex items-center justify-center gap-2 text-xs uppercase tracking-[0.2em] font-semibold text-ink disabled:opacity-50"
-              >
-                <ImagePlus className="w-5 h-5" />
-                Из галереи
-              </button>
-            </div>
+            <button
+              type="button"
+              disabled={uploading || pendingPreviewUrl !== null}
+              onClick={pickFromGallery}
+              className="flex w-full items-center justify-center gap-2 border border-ink py-4 text-xs font-semibold uppercase tracking-[0.2em] text-ink disabled:opacity-50"
+            >
+              <ImagePlus className="h-5 w-5" />
+              Из галереи
+            </button>
             <p className="text-[11px] text-muted leading-relaxed text-center">
-              После нажатия «Отправить» фото появится у всех на вкладке «Лента». Удалить снимок может любой, у кого
-              есть код (на случай случайного кадра).
+              Снимок с камеры: круглая кнопка, затем «В ленту» или «Переснять». Из галереи — сразу в ленту. Удалить
+              снимок может любой с кодом.
             </p>
           </div>
         )}
